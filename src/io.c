@@ -23,6 +23,8 @@
 #if defined(_WIN32) || defined(_WIN64)
   #include <winsock.h>
   #include <io.h>
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h> 
   #define open  _open
   #define close _close
   #define read  _read
@@ -288,6 +290,113 @@ mrb_io_s_popen(mrb_state *mrb, mrb_value klass)
   }
   return result;
 }
+#else /* WIN32 */
+mrb_value
+mrb_io_s_popen(mrb_state *mrb, mrb_value klass)
+{
+#define SAFE_CLOSE(x) if(x) CloseHandle(x)
+  mrb_value cmd, io, result;
+  mrb_value mode = mrb_str_new_cstr(mrb, "r");
+  mrb_value opt  = mrb_hash_new(mrb);
+
+  struct mrb_io *fptr;
+  char *pname;
+  int flags, fd = -1, write_fd = -1;
+  HANDLE pr[2] = { NULL, NULL };
+  HANDLE pw[2] = { NULL, NULL };
+
+  PROCESS_INFORMATION piProcInfo;
+  STARTUPINFO siStartInfo;
+  SECURITY_ATTRIBUTES saAttr;
+  BOOL bSuccess = FALSE;
+
+  mrb_get_args(mrb, "S|SH", &cmd, &mode, &opt);
+  io = mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(klass), NULL, &mrb_io_type));
+
+  pname = mrb_string_value_cstr(mrb, &cmd);
+  flags = mrb_io_modestr_to_flags(mrb, mrb_string_value_cstr(mrb, &mode));
+
+  if (!strcmp(pname, "-")) {
+    mrb_raisef(mrb, E_IO_ERROR, "'-' is not supported on Win32");
+  }
+
+  memset(&saAttr, 0, sizeof(SECURITY_ATTRIBUTES));
+  saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+  saAttr.bInheritHandle = TRUE;
+  saAttr.lpSecurityDescriptor = NULL;
+
+  if (flags & FMODE_READABLE) {
+    /* Create a pipe for the child process's STDOUT. */
+    if (!CreatePipe(&pr[1], &pw[1], &saAttr, 0)) {
+      mrb_raisef(mrb, E_IO_ERROR, "CreatePipe failed");
+    }
+    if (!SetHandleInformation(pr[1], HANDLE_FLAG_INHERIT, 0)) {
+      mrb_raisef(mrb, E_IO_ERROR, "SetHandleInformation");
+    }
+  }
+
+  if (flags & FMODE_WRITABLE) {
+    /* Create a pipe for the child process's STDIN. */
+    if (!CreatePipe(&pr[0], &pw[0], &saAttr, 0)) {
+      mrb_raisef(mrb, E_IO_ERROR, "CreatePipe failed");
+    }
+    if (!SetHandleInformation(pr[0], HANDLE_FLAG_INHERIT, 0)) {
+      mrb_raisef(mrb, E_IO_ERROR, "SetHandleInformation");
+    }
+  }
+
+  /* start child */
+  memset(&piProcInfo, 0, sizeof(PROCESS_INFORMATION));
+  memset(&siStartInfo, 0, sizeof(STARTUPINFO));
+  siStartInfo.cb = sizeof(STARTUPINFO); 
+  /* siStartInfo.hStdError = g_hChildStd_OUT_Wr; */
+  siStartInfo.hStdOutput = pw[1];
+  siStartInfo.hStdInput = pr[0];
+  siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
+  bSuccess = CreateProcess(NULL,
+      pname,     // command line
+      NULL,          // process security attributes 
+      NULL,          // primary thread security attributes 
+      TRUE,          // handles are inherited 
+      0,             // creation flags 
+      NULL,          // use parent's environment 
+      NULL,          // use parent's current directory 
+      &siStartInfo,  // STARTUPINFO pointer 
+      &piProcInfo);  // receives PROCESS_INFORMATION
+
+  if (!bSuccess) {
+    SAFE_CLOSE(pw[0]);
+    SAFE_CLOSE(pr[0]);
+    SAFE_CLOSE(pw[1]);
+    SAFE_CLOSE(pr[1]);
+    mrb_raisef(mrb, E_IO_ERROR, "CreateProcess failed");
+  }
+  CloseHandle(piProcInfo.hProcess);
+  CloseHandle(piProcInfo.hThread);
+
+  SAFE_CLOSE(pw[1]);
+  SAFE_CLOSE(pr[0]);
+
+  mrb_iv_set(mrb, io, mrb_intern_cstr(mrb, "@buf"), mrb_str_new_cstr(mrb, ""));
+  mrb_iv_set(mrb, io, mrb_intern_cstr(mrb, "@pos"), mrb_fixnum_value(0));
+
+  if (pr[1])
+    fd = _open_osfhandle((intptr_t)pr[1], _O_RDONLY);
+  if (pw[0])
+    write_fd = _open_osfhandle((intptr_t)pw[0], 0);
+  fptr = mrb_io_alloc(mrb);
+  fptr->fd = fd;
+  fptr->fd2 = write_fd;
+  fptr->pid = (int)piProcInfo.dwProcessId;
+  fptr->writable = ((flags & FMODE_WRITABLE) != 0);
+  fptr->sync = 0;
+
+  DATA_TYPE(io) = &mrb_io_type;
+  DATA_PTR(io)  = fptr;
+  result = io;
+
+  return result;
+}
 #endif
 
 mrb_value
@@ -357,6 +466,25 @@ fptr_finalize(mrb_state *mrb, struct mrb_io *fptr, int noraise)
     do {
       pid = waitpid(fptr->pid, NULL, 0);
     } while (pid == -1 && errno == EINTR);
+  }
+#else
+  if (fptr->pid != 0) {
+    DWORD dwWaitStatus, code;
+    HANDLE hProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION,
+      FALSE, fptr->pid);
+    dwWaitStatus = WaitForSingleObject(hProcess, INFINITE);
+    if (dwWaitStatus == WAIT_OBJECT_0) {
+      if(GetExitCodeProcess(hProcess, &code) == FALSE) {
+        n = 1;
+      } else {
+        fprintf(stderr, "Exit %d\n", code);
+        fflush(stderr);
+      }
+    } else {
+        n = 1;
+    }
+    if (hProcess)
+      CloseHandle(hProcess);
   }
 #endif
 
@@ -865,8 +993,8 @@ mrb_init_io(mrb_state *mrb)
   MRB_SET_INSTANCE_TT(io, MRB_TT_DATA);
 
   mrb_include_module(mrb, io, mrb_module_get(mrb, "Enumerable")); /* 15.2.20.3 */
-#ifndef _WIN32
   mrb_define_class_method(mrb, io, "_popen",  mrb_io_s_popen,   MRB_ARGS_ANY());
+#ifndef _WIN32
   mrb_define_class_method(mrb, io, "_sysclose",  mrb_io_s_sysclose, MRB_ARGS_REQ(1));
 #endif
   mrb_define_class_method(mrb, io, "for_fd",  mrb_io_s_for_fd,   MRB_ARGS_ANY());
